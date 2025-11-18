@@ -209,9 +209,9 @@ class MultiAgentRAGService:
         self.vector_store.clear_all()
         logger.info("✅ Cleared all collections")
     
-    def get_conversation_summary(self) -> str:
+    def get_conversation_summary(self, current_person_name: Optional[str] = None) -> str:
         """Get summary of conversation history."""
-        return self.orchestrator.get_conversation_summary()
+        return self.orchestrator.get_conversation_summary(current_person_name=current_person_name)
     
     def get_topics(self) -> List[str]:
         """Get list of all topics."""

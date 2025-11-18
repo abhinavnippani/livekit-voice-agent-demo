@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from livekit.agents import llm
 from livekit.agents.voice import Agent
 from livekit.agents.llm import function_tool
+from livekit.agents import AutoSubscribe
 from livekit.plugins import silero
 
 # Import multi-agent RAG service
@@ -158,7 +159,9 @@ def create_agent(config: AgentConfig | None = None) -> Agent:
         "The event stays focused on interruption management, latency, and streaming for live voice experiences. "
         "Handle light conversation yourself, but whenever the user asks anything technical or summons an expert, "
         "call the `query_networking_event` tool. Read the tool's response verbatim—it already includes "
-        "the speaker's backstory, personality, and topic-specific context."
+        "the speaker's backstory, personality, and topic-specific context.\n\n"
+        "IMPORTANT: When the tool returns a handoff message (indicating a switch to another expert), "
+        "you MUST speak that message exactly as provided. Do not paraphrase or add commentary—just say the message verbatim."
     )
     chat_ctx.add_message(role="system", content=system_prompt)
     
@@ -168,6 +171,9 @@ def create_agent(config: AgentConfig | None = None) -> Agent:
         min_silence_duration=config.vad.min_silence_duration,
         activation_threshold=config.vad.activation_threshold,
     )
+    
+    # Store LLM model string for use in message generation
+    llm_model_str = config.llm.model
     
     # Define the multi-agent query function tool
     @function_tool(
@@ -189,9 +195,93 @@ def create_agent(config: AgentConfig | None = None) -> Agent:
             result = multi_agent_service.query(query)
             
             if result["handoff"]:
-                # Handoff occurred - return handoff message
+                # Handoff occurred - split into two parts: transition then greeting
                 logger.info(f"🔄 Handoff: switching to {result['person']}")
-                return result["handoff_message"]
+                
+                # Get session and context from agent
+                session = getattr(agent, '_session', None)
+                ctx = getattr(agent, '_ctx', None)
+                
+                # Get new person identity
+                new_person = result["person_obj"]
+                old_person = result.get("old_person")
+                new_identity = new_person.name
+                
+                # Generate context-aware transition and greeting messages using LLM
+                transition_message, greeting_message = await _generate_context_aware_handoff_messages(
+                    llm_model_str=llm_model_str,
+                    old_person=old_person,
+                    new_person=new_person,
+                    user_query=result.get("user_query", query),
+                    conversation_summary=result.get("conversation_summary", ""),
+                    fallback_transition=result.get("transition_message", ""),
+                    fallback_greeting=result.get("greeting_message", ""),
+                )
+                
+                # Step 1: Return transition message - current person says this
+                logger.info(f"✅ Returning transition message for current person: {transition_message[:100]}...")
+                
+                # Step 2: Schedule greeting to be spoken after transition
+                # We'll use a background task to send data message and speak greeting
+                async def handle_handoff_greeting():
+                    """Handle the greeting part of handoff after transition is spoken"""
+                    import asyncio
+                    # Calculate delay based on message length (roughly 150 words per minute = 2.5 words per second)
+                    # Add extra buffer for TTS processing
+                    word_count = len(transition_message.split())
+                    estimated_seconds = max(2.0, (word_count / 2.5) + 0.5)  # At least 2 seconds, plus buffer
+                    logger.info(f"Waiting {estimated_seconds:.1f}s for transition message to finish (estimated from {word_count} words)")
+                    await asyncio.sleep(estimated_seconds)
+                    
+                    # Send data message with new person name and details
+                    if ctx:
+                        try:
+                            import json
+                            from livekit import rtc
+                            person_data = {
+                                "type": "person_name",
+                                "name": new_identity
+                            }
+                            # Add person details
+                            if new_person:
+                                person_data.update({
+                                    "backstory": new_person.backstory,
+                                    "topic": new_person.topic,
+                                    "personality": new_person.personality_type
+                                })
+                            person_name_data = json.dumps(person_data)
+                            data_bytes = person_name_data.encode('utf-8')
+                            
+                            try:
+                                await ctx.room.local_participant.publish_data(
+                                    data_bytes,
+                                    kind=rtc.DataPacket_Kind.RELIABLE
+                                )
+                                logger.info(f"✅ Sent person name data message after transition: {new_identity}")
+                            except (TypeError, AttributeError):
+                                await ctx.room.local_participant.publish_data(data_bytes)
+                                logger.info(f"✅ Sent person name data message after transition (method 2): {new_identity}")
+                            
+                            # Small delay to ensure data message is processed
+                            await asyncio.sleep(0.1)
+                        except Exception as e:
+                            logger.warning(f"Failed to send person name data message: {e}")
+                    
+                    # Speak the greeting from new person
+                    if session and greeting_message:
+                        try:
+                            logger.info(f"✅ Speaking greeting from new person: {greeting_message[:100]}...")
+                            await session.say(greeting_message, allow_interruptions=True)
+                        except Exception as e:
+                            logger.warning(f"Failed to speak greeting message: {e}")
+                
+                # Start background task for greeting
+                if session:
+                    import asyncio
+                    asyncio.create_task(handle_handoff_greeting())
+                
+                # Return transition message - this will be spoken by current person
+                return transition_message.strip()
             else:
                 # Current person handles query
                 person_obj = result["person_obj"]
@@ -252,6 +342,120 @@ Integrate the context naturally without saying "the context says" or similar.
     logger.info("✅ Multi-agent system integrated with LiveKit agent")
     
     return agent
+
+
+async def _generate_context_aware_handoff_messages(
+    llm_model_str: str,
+    old_person,
+    new_person,
+    user_query: str,
+    conversation_summary: str,
+    fallback_transition: str,
+    fallback_greeting: str,
+) -> tuple[str, str]:
+    """
+    Generate context-aware transition and greeting messages using LLM.
+    
+    Args:
+        llm_model_str: LLM model identifier string
+        old_person: PersonAgent being handed off from
+        new_person: PersonAgent being handed off to
+        user_query: The user's query that triggered the handoff
+        conversation_summary: Summary of conversation history
+        fallback_transition: Fallback transition message if LLM generation fails
+        fallback_greeting: Fallback greeting message if LLM generation fails
+    
+    Returns:
+        Tuple of (transition_message, greeting_message)
+    """
+    try:
+        # Create LLM instance from model string
+        from livekit.agents import llm as llm_module
+        try:
+            llm_model = llm_module.LLM.create(llm_model_str)
+        except Exception as e:
+            logger.warning(f"Failed to create LLM instance: {e}, using fallback")
+            return fallback_transition, fallback_greeting
+        
+        # Create a temporary chat context for generating messages
+        temp_ctx = llm_module.ChatContext()
+        
+        # Build prompt for transition message (from old person's perspective)
+        transition_prompt = f"""You are {old_person.name} at a networking event. You need to hand off the conversation to {new_person.name}, who specializes in {new_person.topic.replace('_', ' ')}.
+
+CONVERSATION CONTEXT:
+{conversation_summary if conversation_summary and conversation_summary.strip() != "No conversation history yet." else "This is the beginning of the conversation."}
+
+USER'S REQUEST:
+"{user_query}"
+
+YOUR PERSONALITY:
+{old_person.personality.description}
+{old_person.personality.response_style}
+
+YOUR BACKSTORY:
+{old_person.backstory}
+
+TASK:
+Generate a natural, in-character transition message (1-2 sentences) where you introduce {new_person.name} to help with the user's question. 
+- Stay true to your personality ({old_person.personality_type})
+- Reference the conversation naturally if relevant
+- Be authentic and conversational, as if you're at a real networking event
+- Keep it brief and natural
+
+Generate ONLY the transition message, nothing else:"""
+
+        temp_ctx.add_message(role="system", content=transition_prompt)
+        temp_ctx.add_message(role="user", content="Generate the transition message now.")
+        
+        # Generate transition message
+        transition_response = await llm_model.chat(ctx=temp_ctx)
+        transition_message = transition_response.choices[0].message.content.strip() if transition_response.choices else fallback_transition
+        
+        # Clear context for greeting
+        temp_ctx = llm_module.ChatContext()
+        
+        # Build prompt for greeting message (from new person's perspective)
+        greeting_prompt = f"""You are {new_person.name} at a networking event. You've just been introduced to help with a question about {new_person.topic.replace('_', ' ')}.
+
+CONVERSATION CONTEXT:
+{conversation_summary if conversation_summary and conversation_summary.strip() != "No conversation history yet." else "This is the beginning of the conversation."}
+
+USER'S REQUEST:
+"{user_query}"
+
+YOUR PERSONALITY:
+{new_person.personality.description}
+{new_person.personality.response_style}
+
+YOUR BACKSTORY:
+{new_person.backstory}
+
+TASK:
+Generate a natural, in-character greeting message (1-2 sentences) where you introduce yourself and acknowledge you can help with their question.
+- Stay true to your personality ({new_person.personality_type})
+- Reference the conversation context naturally if relevant
+- Be authentic and conversational
+- Keep it brief and welcoming
+
+Generate ONLY the greeting message, nothing else:"""
+
+        temp_ctx.add_message(role="system", content=greeting_prompt)
+        temp_ctx.add_message(role="user", content="Generate the greeting message now.")
+        
+        # Generate greeting message
+        greeting_response = await llm_model.chat(ctx=temp_ctx)
+        greeting_message = greeting_response.choices[0].message.content.strip() if greeting_response.choices else fallback_greeting
+        
+        logger.info(f"✅ Generated context-aware messages:")
+        logger.info(f"   Transition: {transition_message[:100]}...")
+        logger.info(f"   Greeting: {greeting_message[:100]}...")
+        
+        return transition_message, greeting_message
+        
+    except Exception as e:
+        logger.warning(f"Failed to generate context-aware messages: {e}, using fallback")
+        return fallback_transition, fallback_greeting
 
 
 def get_greeting_message(config: AgentConfig | None = None) -> str:

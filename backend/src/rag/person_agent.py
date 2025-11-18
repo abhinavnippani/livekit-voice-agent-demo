@@ -104,7 +104,8 @@ Remember: You are {self.name}, and you're here to share your expertise in {self.
             for peer in peers:
                 extras += f"- {peer}\n"
         if conversation_summary and conversation_summary.strip() and conversation_summary.strip() != "No conversation history yet.":
-            extras += f"\nCONVERSATION SUMMARY SO FAR:\n{conversation_summary}\n"
+            extras += f"\nCONVERSATION HISTORY:\n{conversation_summary}\n"
+            extras += "\nIMPORTANT: If you've talked with this user before, reference your previous conversation naturally. Remember what was discussed and build on it. If this is your first time talking with them, introduce yourself warmly.\n"
         return base_prompt + extras
     
     def get_greeting(self) -> str:

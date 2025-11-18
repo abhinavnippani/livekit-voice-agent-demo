@@ -22,6 +22,14 @@ from livekit import rtc
 
 from .agent_config import create_agent, get_greeting_message
 
+# Import multi-agent RAG service to get current person
+import sys
+from pathlib import Path
+backend_src = Path(__file__).parent.parent
+if str(backend_src) not in sys.path:
+    sys.path.insert(0, str(backend_src))
+from rag.multi_agent_rag_service import get_multi_agent_rag_service
+
 # Load .env file from the backend directory
 env_path = Path(__file__).parent.parent.parent / ".env"
 load_dotenv(env_path)
@@ -36,6 +44,17 @@ async def entrypoint(ctx: JobContext):
     logger.info("Agent starting for room: %s", ctx.room.name)
     logger.info("Job ID: %s", ctx.job.id if hasattr(ctx.job, 'id') else 'N/A')
     logger.info("Room name from context: %s", ctx.room.name)
+    
+    # Get current person identity and details before connecting
+    current_person_obj = None
+    try:
+        multi_agent_service = get_multi_agent_rag_service()
+        current_person_obj = multi_agent_service.get_current_person()
+        agent_identity = current_person_obj.name
+        logger.info("Setting agent identity to: %s", agent_identity)
+    except Exception as e:
+        logger.warning("Failed to get current person identity: %s, using default", e)
+        agent_identity = "agent"
     
     # Event to signal when a participant with SUBSCRIBED audio track is ready
     participant_ready_event = asyncio.Event()
@@ -114,8 +133,10 @@ async def entrypoint(ctx: JobContext):
     
     # Connect to the room
     logger.info("Connecting to room: %s", ctx.room.name)
+    logger.info("Setting agent name to: %s", agent_identity)
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     logger.info("Agent connected to room: %s", ctx.room.name)
+    
     logger.info("Room connection state: %s", ctx.room.connection_state)
     # Room.sid might be a property or coroutine - skip for now to avoid errors
     # logger.info("Room SID: %s", ctx.room.sid)  # Skip SID logging to avoid coroutine issues
@@ -207,6 +228,10 @@ async def entrypoint(ctx: JobContext):
     # Create agent session
     session = AgentSession()
     
+    # Store session reference in agent for handoff-triggered restarts
+    agent._session = session
+    agent._ctx = ctx
+    
     # Create an event to wait for room disconnection
     disconnect_event = asyncio.Event()
     
@@ -276,6 +301,51 @@ async def entrypoint(ctx: JobContext):
         logger.info("Session input configured: %s", type(session.input).__name__)
     if hasattr(session, 'output') and session.output:
         logger.info("Session output configured: %s", type(session.output).__name__)
+    
+    # Send person name and details as data message to frontend
+    # This allows the frontend to display the correct person name and details in transcriptions
+    try:
+        import json
+        person_data = {
+            "type": "person_name",
+            "name": agent_identity
+        }
+        # Add person details if available
+        if current_person_obj:
+            person_data.update({
+                "backstory": current_person_obj.backstory,
+                "topic": current_person_obj.topic,
+                "personality": current_person_obj.personality_type
+            })
+        person_name_data = json.dumps(person_data)
+        # Publish data to room - try different API approaches
+        data_bytes = person_name_data.encode('utf-8')
+        
+        # Try method 1: publish_data with bytes and kind
+        try:
+            await ctx.room.local_participant.publish_data(
+                data_bytes,
+                kind=rtc.DataPacket_Kind.RELIABLE
+            )
+            logger.info("Sent person name data message (method 1): %s", agent_identity)
+        except (TypeError, AttributeError) as e1:
+            # Try method 2: publish_data with just bytes
+            try:
+                await ctx.room.local_participant.publish_data(data_bytes)
+                logger.info("Sent person name data message (method 2): %s", agent_identity)
+            except Exception as e2:
+                # Try method 3: Create DataPacket if that's the API
+                try:
+                    data_packet = rtc.DataPacket(
+                        data=data_bytes,
+                        kind=rtc.DataPacket_Kind.RELIABLE
+                    )
+                    await ctx.room.local_participant.publish_data(data_packet)
+                    logger.info("Sent person name data message (method 3): %s", agent_identity)
+                except Exception as e3:
+                    logger.warning("All data publishing methods failed. Errors: %s, %s, %s", e1, e2, e3)
+    except Exception as e:
+        logger.warning("Failed to send person name data message: %s", e, exc_info=True)
     
     # Send initial greeting message from agent config
     # This ensures the agent starts the conversation and verifies TTS output
